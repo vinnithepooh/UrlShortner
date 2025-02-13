@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Serverless URL Shortener using AWS Lambda, API Gateway, DynamoDB, and SQS"
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: "S3 bucket for Lambda deployment"
+
+
+Resources:
+
+  ShortURLsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ShortURLs
+      AttributeDefinitions:
+        - AttributeName: short_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: short_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TimeToLiveSpecification:
+        AttributeName: expiry_timestamp
+        Enabled: true
+
+  ### DynamoDB Table for Click Analytics ###
+  ClickAnalyticsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ClickAnalytics
+      AttributeDefinitions:
+        - AttributeName: short_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: short_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  ### SQS Queue for Event-Driven Analytics ###
+  AnalyticsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: URLClickEvents
+
+  ### IAM Role for Lambda Functions ###
+  LambdaExecutionRoleNew:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRoleNew
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaDynamoDBPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: 
+                  - !GetAtt ShortURLsTable.Arn
+                  - !GetAtt ClickAnalyticsTable.Arn
+        - PolicyName: LambdaSQSPublishPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - sqs:SendMessage
+                Resource: !GetAtt AnalyticsQueue.Arn
+        - PolicyName: LambdaSQSTriggerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt AnalyticsQueue.Arn
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+        - PolicyName: APIGatewayInvokePermission  
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource: 
+                  - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*"
+
+  ### Lambda Function: ShortenURL ###
+  ShortenURLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ShortenURL
+      Handler: shorten_url.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRoleNew.Arn
+      Code:
+        S3Bucket: url-shortner-new-bucket
+        S3Key: shorten_url.zip
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ShortURLsTable
+      Timeout: 5
+
+  ### Lambda Function: RedirectURL ###
+  RedirectURLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RedirectURL
+      Handler: redirect_url.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRoleNew.Arn
+      Code:
+        S3Bucket: url-shortner-new-bucket
+        S3Key: redirect_url.zip
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ShortURLsTable
+          SQS_QUEUE_URL: !Ref AnalyticsQueue
+      Timeout: 5
+
+  ### Lambda Function: ProcessAnalytics ###
+  ProcessAnalyticsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessAnalytics
+      Handler: process_analytics.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRoleNew.Arn
+      Code:
+        S3Bucket: url-shortner-new-bucket
+        S3Key: process_analytics.zip
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ClickAnalyticsTable
+      Timeout: 5
+      
+  ProcessAnalyticsSQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt AnalyticsQueue.Arn
+      FunctionName: !Ref ProcessAnalyticsFunction
+
+
+
+  ### API Gateway ###
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: URLShortenerAPI
+      Description: "API Gateway for URL Shortener Service"
+
+  ### POST /shorten API Endpoint ###
+  ShortenAPIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "shorten"
+      RestApiId: !Ref ApiGateway
+
+  ShortenAPIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ShortenAPIResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !GetAtt ShortenURLFunction.Arn
+
+  ### GET /{short_id} API Endpoint ###
+  RedirectAPIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "{short_id}"
+      RestApiId: !Ref ApiGateway
+
+  RedirectAPIMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref RedirectAPIResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: GET  #POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !GetAtt RedirectURLFunction.Arn
+
+  ### Lambda Permissions for API Gateway ###
+  LambdaInvokePermissionShorten:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ShortenURLFunction
+      Principal: apigateway.amazonaws.com
+
+  LambdaInvokePermissionRedirect:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RedirectURLFunction
+      Principal: apigateway.amazonaws.com
+
+Outputs:
+  APIEndpoint:
+    Description: "Base URL of the API Gateway"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/"
